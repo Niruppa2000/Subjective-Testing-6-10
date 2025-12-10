@@ -1,3 +1,4 @@
+import re
 import numpy as np
 import torch
 import streamlit as st
@@ -12,8 +13,12 @@ from pypdf import PdfReader
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-GEN_MODEL_NAME = "google/flan-t5-base"   # use flan-t5-large if you have more RAM
-TOP_K = 5
+
+# Use base Flan-T5 for deployment
+# (if you later push your fine-tuned model to HF / repo, change this name)
+GEN_MODEL_NAME = "google/flan-t5-base"
+
+TOP_K = 4  # how many chunks to retrieve as context
 
 
 # ============================
@@ -47,7 +52,7 @@ def build_chunks(text: str, chunk_size: int = 800, overlap: int = 150):
 # ============================
 # LOAD MODELS (CACHED)
 # ============================
-@st.cache_resource(show_spinner="Loading models (embedding + Flan-T5)...")
+@st.cache_resource(show_spinner="Loading models (embeddings + Flan-T5)...")
 def load_models():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     embedder = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
@@ -60,8 +65,11 @@ def load_models():
 # INDEX BUILDING
 # ============================
 def build_index_from_files(uploaded_files):
-    """Convert uploaded PDFs into chunked docs."""
-    docs = []  # list of {"doc_id", "chunk_id", "text"}
+    """
+    Convert uploaded NCERT PDFs into chunked docs.
+    Returns list[dict]: {"doc_id", "chunk_id", "text"}
+    """
+    docs = []
     for f in uploaded_files:
         raw_text = extract_text_from_pdf_filelike(f)
         chunks = build_chunks(raw_text, CHUNK_SIZE, CHUNK_OVERLAP)
@@ -109,35 +117,36 @@ def retrieve_context(query: str, index, embedder, docs, top_k: int = TOP_K):
 # ============================
 def clean_and_extract_questions(raw_text: str, topic: str, num_questions: int):
     """
-    Take raw model output and extract a clean list of questions.
-    If the model doesn't give enough good lines, fill using templates.
+    Turn raw model output (e.g. '1. Q1? 2. Q2? 3. Q3?') into a clean list of questions.
+
+    - Splits using numbering patterns: 1., 2., 3.
+    - Ensures each question ends with '?'
+    - Filters out junk
+    - Fills remaining slots with templates based on the topic
     """
-    lines = [ln.strip() for ln in raw_text.split("\n") if ln.strip()]
+    # Normalize spaces/newlines into a single string
+    raw = " ".join(raw_text.split()).strip()
+
+    # Capture segments like "1. ... 2. ... 3. ..."
+    segments = []
+    for match in re.finditer(r"\d+\.\s*(.+?)(?=\d+\.|$)", raw):
+        seg = match.group(1).strip()
+        segments.append(seg)
+
+    # If no numbered pattern found, treat whole text as one segment
+    if not segments and raw:
+        segments = [raw]
+
     questions = []
 
-    for ln in lines:
-        text = ln
+    for seg in segments:
+        text = seg.strip()
 
-        # Remove numbering like "1. " or "2) "
-        if text[0].isdigit():
-            # find first '.' or ')'
-            pos_dot = text.find(".")
-            pos_paren = text.find(")")
-            cut_pos = -1
-            if pos_dot != -1 and pos_paren != -1:
-                cut_pos = min(pos_dot, pos_paren)
-            elif pos_dot != -1:
-                cut_pos = pos_dot
-            elif pos_paren != -1:
-                cut_pos = pos_paren
-            if cut_pos != -1 and cut_pos + 1 < len(text):
-                text = text[cut_pos + 1 :].strip()
-
-        # Remove leading bullet
+        # Remove leading bullet if present
         if text.startswith("- "):
             text = text[2:].strip()
 
-        # Ignore very short junk like "On what??"
+        # Ignore very short junk
         if len(text.split()) < 4:
             continue
 
@@ -147,7 +156,7 @@ def clean_and_extract_questions(raw_text: str, topic: str, num_questions: int):
 
         questions.append(text)
 
-    # Fallback: use templates if not enough questions
+    # ---- Fallback templates based on topic ----
     templates = [
         f"What do you mean by {topic}?",
         f"Explain {topic} in detail with suitable examples.",
@@ -158,14 +167,15 @@ def clean_and_extract_questions(raw_text: str, topic: str, num_questions: int):
         f"Write a short note on {topic}.",
     ]
 
-    # Add templates until we have at least num_questions
+    # Deduplicate while filling up to num_questions
+    seen = set(q.lower() for q in questions)
     for t in templates:
         if len(questions) >= num_questions:
             break
-        if t not in questions:
+        if t.lower() not in seen:
             questions.append(t)
+            seen.add(t.lower())
 
-    # Return exactly num_questions
     return questions[:num_questions]
 
 
@@ -184,14 +194,11 @@ def generate_questions(
     device,
 ):
     """
-    Generate questions by asking Flan-T5 for a numbered list,
-    then cleaning and enforcing proper question format.
+    Retrieve context from the uploaded PDFs and generate exam-style questions.
     """
-    # 1) Retrieve context
-    chunks = retrieve_context(topic, index, embedder, docs, top_k=TOP_K)
-    context_text = "\n\n".join([c["text"] for c in chunks])
+    retrieved = retrieve_context(topic, index, embedder, docs, top_k=TOP_K)
+    context_text = "\n\n".join([c["text"] for c in retrieved])
 
-    # 2) Build prompt
     prompt = f"""
 You are an experienced NCERT Class {target_class} teacher.
 
@@ -200,19 +207,18 @@ on the topic "{topic}".
 
 Rules:
 - Questions must be simple and meaningful for Class {target_class}.
-- They should start with words like: What, Why, How, Explain, Describe, Define, List, etc.
+- Start with words like: What, Why, How, Explain, Describe, Define, List, etc.
 - Each question must be complete and end with a question mark (?).
 - Write them in this exact format:
 1. Question 1?
 2. Question 2?
 3. Question 3?
-Do not add any extra sentences before or after the list.
+(only the numbered list, nothing else).
 
 CONTEXT:
 {context_text}
-"""
+""".strip()
 
-    # 3) Generate
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
     with torch.no_grad():
         outputs = gen_model.generate(
@@ -225,13 +231,10 @@ CONTEXT:
         )
 
     raw_text = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-
-    # 4) Clean + enforce question format + fallback templates
     questions = clean_and_extract_questions(raw_text, topic, num_questions)
 
-    # Nicely numbered block for display
     questions_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
-    return questions_block, chunks
+    return questions_block, retrieved
 
 
 # ============================
@@ -243,13 +246,8 @@ def main():
 
     st.markdown(
         """
-Upload **NCERT PDFs (Science / Social Science / etc.) for Classes 6–10**  
-and generate **exam-style questions** like:
-
-- *What is a balanced diet?*  
-- *How is photosynthesis useful to plants? Explain.*  
-- *What do you mean by the Harappan civilisation?*
-"""
+Upload **NCERT PDFs (Science) for Classes 6–10**  
+and generate **exam-style subjective questions**, """
     )
 
     uploaded_files = st.file_uploader(
@@ -262,10 +260,10 @@ and generate **exam-style questions** like:
     with col1:
         target_class = st.selectbox("Select Class", [6, 7, 8, 9, 10], index=0)
     with col2:
-        num_questions = st.slider("How many questions?", 1, 10, 3)
+        num_questions = st.slider("How many questions?", 1, 10, 5)
 
     topic = st.text_input(
-        "Enter Topic (Example: Balanced diet, Motion, Acids Bases Salts, Ashoka, Mughal Empire)"
+        "Enter Topic (Example: Balanced diet, Motion, Acids Bases Salts, Ashoka, Harappan civilisation)"
     )
 
     if not uploaded_files:
