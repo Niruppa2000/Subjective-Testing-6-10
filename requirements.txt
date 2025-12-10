@@ -2,6 +2,7 @@ streamlit
 sentence-transformers
 faiss-cpu
 transformers
-torch
+torch==2.0.1
 pypdf
 numpy
+
