@@ -12,7 +12,7 @@ from pypdf import PdfReader
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-GEN_MODEL_NAME = "google/flan-t5-large"   # you can change to base if RAM is low
+GEN_MODEL_NAME = "google/flan-t5-base"   # use -large if you have enough RAM
 TOP_K = 5
 
 
@@ -105,7 +105,14 @@ def retrieve_context(query: str, index, embedder, docs, top_k: int = TOP_K):
 
 
 # ============================
-# QUESTION GENERATION (ONE BY ONE)
+# HELPER: COSINE SIMILARITY
+# ============================
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+
+
+# ============================
+# QUESTION GENERATION (UNIQUE)
 # ============================
 def generate_questions(
     topic: str,
@@ -119,61 +126,90 @@ def generate_questions(
     device,
 ):
     """
-    Generate EXACTLY num_questions questions by calling the model
-    once per question. This guarantees the count.
+    Generate EXACTLY num_questions questions.
+    Uses semantic similarity to avoid repeating the same question.
     """
-    # 1) Retrieve context only once
+    # 1) Retrieve context once
     chunks = retrieve_context(topic, index, embedder, docs, top_k=TOP_K)
     context_text = "\n\n".join([c["text"] for c in chunks])
 
     questions = []
+    question_vecs = []
 
     for i in range(num_questions):
-        already = ""
-        if questions:
-            already = "\nAlready generated questions (do NOT repeat these):\n" + \
-                      "\n".join([f"{j+1}. {q}" for j, q in enumerate(questions)])
+        # Try multiple times to get a different question
+        attempt = 0
+        best_candidate = None
 
-        prompt = f"""
+        while attempt < 5:
+            already = ""
+            if questions:
+                already = "\nExisting questions (do NOT repeat these, create something new):\n" + \
+                          "\n".join([f"- {q}" for q in questions])
+
+            prompt = f"""
 You are an experienced NCERT Science teacher for Class {target_class}.
-Your job is to create exam-style LONG ANSWER questions for the topic: "{topic}".
+Create ONE NEW, DIFFERENT, long-answer exam question for the topic: "{topic}".
 
-Use ONLY the SCIENCE textbook context given below.
+Use ONLY the following NCERT Science textbook context:
 
-CONTEXT:
 {context_text}
+
 {already}
 
-Now generate exactly ONE NEW, DIFFERENT, long-answer Science question.
-Rules:
-- The question must require a detailed answer of at least 4–8 lines.
-- It should begin with words like: Explain, Describe, What do you mean by, How does, Why, etc.
-- Do NOT give the answer.
-- Output ONLY the question sentence, nothing else (no numbering, no extra text).
+Requirements:
+- Output ONLY ONE question sentence.
+- Start with words like: Explain, Describe, What do you mean by, How does, Why, etc.
+- The question must require a detailed answer (4–8 lines).
+- The new question must be semantically different from all existing questions.
 """
 
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
-        with torch.no_grad():
-            outputs = gen_model.generate(
-                **inputs,
-                max_new_tokens=96,
-                num_beams=4,
-                temperature=0.7,
-                no_repeat_ngram_size=3,
-                early_stopping=True,
-            )
-        text = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-        # Clean up formatting
-        text = text.replace("\n", " ").strip()
-        # Sometimes model adds a leading number or dash
-        if text[:2].isdigit() and "." in text[:4]:
-            text = text.split(".", 1)[1].strip()
-        if text.startswith("- "):
-            text = text[2:].strip()
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
+            with torch.no_grad():
+                outputs = gen_model.generate(
+                    **inputs,
+                    max_new_tokens=96,
+                    do_sample=True,
+                    top_p=0.9,
+                    temperature=0.9,
+                    no_repeat_ngram_size=3,
+                    num_beams=1,
+                    early_stopping=True,
+                )
+            text = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+            text = text.replace("\n", " ").strip()
 
-        questions.append(text)
+            # Clean possible numbering / bullets
+            if text[:2].isdigit() and "." in text[:4]:
+                text = text.split(".", 1)[1].strip()
+            if text.startswith("- "):
+                text = text[2:].strip()
 
-    # Build nicely numbered block
+            best_candidate = text
+
+            # If it's the first question, accept directly
+            if not questions:
+                break
+
+            # Check similarity with previous questions
+            cand_vec = embedder.encode(text, convert_to_numpy=True)
+            sims = [cosine_sim(cand_vec, prev) for prev in question_vecs]
+            max_sim = max(sims) if sims else 0.0
+
+            # If it's not too similar, accept it
+            if max_sim < 0.85:
+                question_vecs.append(cand_vec)
+                break
+
+            attempt += 1
+
+        # After attempts, accept best_candidate anyway
+        questions.append(best_candidate)
+        if len(question_vecs) < len(questions):  # first question or fallback
+            q_vec = embedder.encode(best_candidate, convert_to_numpy=True)
+            question_vecs.append(q_vec)
+
+    # Nicely numbered block
     questions_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
     return questions_block, chunks
 
@@ -189,13 +225,6 @@ def main():
         """
 Upload **NCERT Science PDFs for Classes 6–10**  
 and generate **exam-style, long-answer subjective questions**.
-
-**Steps:**
-1. Upload Science PDFs (Class 6–10)  
-2. Select the class level  
-3. Enter a *Science topic or chapter name*  
-4. Choose how many questions you want  
-5. Click **Generate Questions**
 """
     )
 
@@ -207,7 +236,7 @@ and generate **exam-style, long-answer subjective questions**.
 
     col1, col2 = st.columns(2)
     with col1:
-        target_class = st.selectbox("Select Class", [6, 7, 8, 9, 10], index=0)
+        target_class = st.selectbox("Select Class", [6, 7, 8, 9, 10], index=1)
     with col2:
         num_questions = st.slider("How many questions?", 1, 10, 5)
 
@@ -219,7 +248,6 @@ and generate **exam-style, long-answer subjective questions**.
         st.info("👆 Please upload at least one NCERT **Science** PDF to begin.")
         return
 
-    # Load models once
     device, embedder, tokenizer, gen_model = load_models()
 
     with st.spinner("Reading PDFs and building Science knowledge base..."):
@@ -232,7 +260,7 @@ and generate **exam-style, long-answer subjective questions**.
     st.success(f"Indexed {len(docs)} text chunks from {len(uploaded_files)} Science PDF(s).")
 
     if topic and st.button("Generate Questions"):
-        with st.spinner(f"Generating {num_questions} science questions..."):
+        with st.spinner(f"Generating {num_questions} unique science questions..."):
             questions_text, retrieved = generate_questions(
                 topic=topic,
                 target_class=target_class,
