@@ -1,14 +1,7 @@
 streamlit==1.26.0
-torch>=2.0.0
-transformers==4.37.0
-tokenizers==0.15.2
-sentencepiece==0.1.99
-peft>=0.8.0
-sentence-transformers==2.2.2
-faiss-cpu
 pandas
-accelerate>=0.20.3
-huggingface-hub>=0.15.1
+
+
 
 
 
