@@ -1,4 +1,8 @@
+numpy==1.25.3
+pandas==2.2.0
 streamlit==1.26.0
+
+
 
 
 
