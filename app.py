@@ -1,145 +1,249 @@
-# app.py (robust tokenizer + LoRA loader for Streamlit)
 import os
-import streamlit as st
-import torch
-import glob
+import re
+import io
 import json
+import gc
+import streamlit as st
+import pandas as pd
+import numpy as np
+import torch
+import faiss
+from typing import List
+from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from peft import PeftModel
 
-# ---------- CONFIG ----------
-BASE_MODEL = "google/flan-t5-base"   # change only if your LoRA used a different base
-LORA_PATH = "./lora_ncert_finetuned"
+# -----------------------
+# Config
+# -----------------------
+st.set_page_config(page_title="NCERT — Similar Question Generator", layout="wide")
+st.title("NCERT — Generate Teacher-Style Questions (CSV → Retrieval → Generation)")
+
+CSV_PATH_IN_REPO = "ncert_teacher_style_questions_full.csv"  # ensure this exists in repo root
+LORA_FOLDER = "./lora_ncert_finetuned"  # adjust if your adapter folder has different name
+BASE_MODEL = "google/flan-t5-base"     # change if your LoRA used different base
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-st.set_page_config(page_title="NCERT Q Generator (LoRA)", layout="wide")
-st.title("NCERT Teacher-Style Question Generator — (LoRA loader debug)")
+# -----------------------
+# Helpers: load CSV
+# -----------------------
+@st.cache_data(show_spinner=False)
+def load_questions_csv(path: str) -> pd.DataFrame:
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+    else:
+        # empty df template
+        df = pd.DataFrame(columns=["Class", "Chapter", "Question"])
+    # Normalize column names
+    df.columns = [c.strip() for c in df.columns]
+    return df
 
-st.write("Device:", DEVICE)
-st.write(f"Expecting LoRA adapter at repository path: `{LORA_PATH}`")
+df = load_questions_csv(CSV_PATH_IN_REPO)
+if df.empty:
+    st.warning(f"No CSV found at {CSV_PATH_IN_REPO}. Upload one or place the downloaded CSV in the repo root.")
+    uploaded = st.file_uploader("Upload CSV (columns: Class, Chapter, Question)", type=["csv"])
+    if uploaded:
+        df = pd.read_csv(uploaded)
+        st.success("CSV uploaded.")
+    else:
+        st.stop()
 
-# Show files present in adapter folder to help debug tokeniser issues
-if os.path.isdir(LORA_PATH):
-    st.write("Files in adapter folder (top-level):")
-    try:
-        files = sorted(os.listdir(LORA_PATH))
-        st.write(files)
-        # show nested entries (one level)
-        nested = {d: sorted(os.listdir(os.path.join(LORA_PATH, d))) for d in files if os.path.isdir(os.path.join(LORA_PATH, d))}
-        if nested:
-            st.write("Nested folders (one level):")
-            st.write(nested)
-    except Exception as e:
-        st.warning(f"Could not list adapter files: {e}")
-else:
-    st.error(f"Adapter folder not found at `{LORA_PATH}`. Please upload it to the repo root.")
+# Display sample
+st.write("Dataset preview:")
+st.dataframe(df.head(8))
 
-# ---------- load model with robust tokenizer fallback ----------
-@st.cache_resource
-def load_tokenizer_and_model():
-    # Strategy:
-    # 1) Try tokenizer from adapter folder (use_fast=True)
-    # 2) If that fails, try adapter folder with use_fast=False
-    # 3) If still fails, fall back to base model tokenizer (use_fast=True then use_fast=False)
+# -----------------------
+# UI controls
+# -----------------------
+col1, col2 = st.columns([2, 1])
+with col2:
+    class_options = sorted(df["Class"].unique().tolist())
+    class_choice = st.selectbox("Choose Class", class_options, index=0 if class_options else 0)
+    chapters_for_class = sorted(df[df["Class"] == class_choice]["Chapter"].unique().tolist())
+    chapter_choice = st.selectbox("Choose Chapter", chapters_for_class, index=0 if chapters_for_class else 0)
+    num_questions = st.slider("How many new questions to generate?", 1, 10, 5)
+    retrieve_k = st.slider("Retrieve K example questions (style)", 1, 8, 4)
+    num_samples = st.slider("Model samples to aggregate (diversity)", 1, 5, 2)
+    generate_btn = st.button("Generate Similar Questions")
+
+# -----------------------
+# Load embedder & FAISS (cached)
+# -----------------------
+@st.cache_resource(show_spinner=False)
+def build_embedder_and_index(df: pd.DataFrame, column: str = "Question"):
+    embedder = SentenceTransformer(EMBED_MODEL, device="cpu")  # keep on CPU for stability
+    texts = df[column].fillna("").astype(str).tolist()
+    emb = embedder.encode(texts, convert_to_numpy=True, show_progress_bar=False).astype("float32")
+    dim = emb.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(emb)
+    return embedder, index, emb
+
+embedder, index, embeddings = build_embedder_and_index(df, "Question")
+
+# -----------------------
+# Load generation model & tokenizer (cached)
+# -----------------------
+@st.cache_resource(show_spinner=True)
+def load_generation_model(base_model: str = BASE_MODEL, adapter_dir: str = LORA_FOLDER):
+    """Return tokenizer, model, bool(adapter_attached)."""
+    # Try tokenizer from adapter first (if present); else from base
     tokenizer = None
-    model = None
-
-    # Helper to attempt tokenizer load safely
-    def try_tokenizer(path, use_fast_flag=True):
+    if os.path.isdir(adapter_dir):
         try:
-            tok = AutoTokenizer.from_pretrained(path, use_fast=use_fast_flag)
-            return tok
-        except Exception as e:
-            return e
-
-    # 1) Attempt tokenizer from adapter (fast)
-    if os.path.isdir(LORA_PATH):
-        st.info("Attempting to load tokenizer from adapter folder (use_fast=True)...")
-        t = try_tokenizer(LORA_PATH, use_fast_flag=True)
-        if isinstance(t, Exception):
-            st.warning(f"Adapter fast tokenizer failed: {t}")
-        else:
-            tokenizer = t
-
-    # 2) Try adapter tokenizer with use_fast=False (SentencePiece / fallback)
-    if tokenizer is None and os.path.isdir(LORA_PATH):
-        st.info("Attempting to load tokenizer from adapter folder (use_fast=False)...")
-        t = try_tokenizer(LORA_PATH, use_fast_flag=False)
-        if isinstance(t, Exception):
-            st.warning(f"Adapter slow tokenizer failed: {t}")
-        else:
-            tokenizer = t
-
-    # 3) Fallback to base tokenizer (fast then slow)
+            tokenizer = AutoTokenizer.from_pretrained(adapter_dir, use_fast=True)
+        except Exception:
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(adapter_dir, use_fast=False)
+            except Exception:
+                tokenizer = None
     if tokenizer is None:
-        st.info(f"Falling back to base tokenizer: {BASE_MODEL}")
-        t = try_tokenizer(BASE_MODEL, use_fast_flag=True)
-        if isinstance(t, Exception):
-            st.warning(f"Base fast tokenizer failed: {t}\nTrying base tokenizer with use_fast=False...")
-            t = try_tokenizer(BASE_MODEL, use_fast_flag=False)
-            if isinstance(t, Exception):
-                # give up
-                st.error("Failed to load any tokenizer (adapter or base). Please ensure tokenizer files (tokenizer.json or spiece.model) are present in the adapter folder or the base model is available.")
-                raise RuntimeError("Tokenizer load failed: " + str(t))
-            else:
-                tokenizer = t
-        else:
-            tokenizer = t
+        tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
 
-    # 4) Load base model (float) and attach LoRA if possible
-    st.info(f"Loading base model: {BASE_MODEL} (this may take a while)...")
-    base = AutoModelForSeq2SeqLM.from_pretrained(BASE_MODEL)
-    base = base.to(DEVICE)
-
-    # Attach LoRA adapter if available and compatible
-    if os.path.isdir(LORA_PATH):
+    # Load base model (float) and attach adapter if possible
+    base = AutoModelForSeq2SeqLM.from_pretrained(base_model)
+    base.to(DEVICE)
+    adapter_attached = False
+    if os.path.isdir(adapter_dir):
         try:
-            st.info("Attaching LoRA adapter from local folder...")
-            model_with_adapter = PeftModel.from_pretrained(base, LORA_PATH)
-            model_with_adapter = model_with_adapter.to(DEVICE)
-            model = model_with_adapter
+            model = PeftModel.from_pretrained(base, adapter_dir)
+            model.to(DEVICE)
+            adapter_attached = True
         except Exception as e:
-            st.warning(f"Could not attach LoRA adapter (possible base-model mismatch). Error: {e}")
-            st.info("Falling back to base model without adapter.")
+            # fallback to base
             model = base
     else:
         model = base
 
-    return tokenizer, model
+    return tokenizer, model, adapter_attached
 
-# Attempt to load and show friendly errors
-try:
-    tokenizer, model = load_tokenizer_and_model()
-    st.success("Tokenizer and model loaded (or base model fallback).")
-except Exception as e:
-    st.error("Model/tokenizer loading failed. See warnings above for details.")
-    # re-raise to make logs available in Streamlit logs
-    raise
+with st.spinner("Loading generation model (may take 20-60s)..."):
+    tokenizer, model, adapter_attached = load_generation_model()
 
-# ---------- simple UI to generate example questions ----------
-st.header("Generate example questions")
-topic = st.text_input("Enter chapter/topic (e.g., Nutrition in Plants):", value="Nutrition in Plants")
-num_q = st.slider("How many questions?", 1, 10, 5)
+if adapter_attached:
+    st.success("LoRA adapter attached to base model.")
+else:
+    st.info("Using base model (adapter not attached or not found).")
 
-if st.button("Generate"):
-    prompt = f"You are an NCERT Class teacher. CHAPTER: {topic}\nGenerate {num_q} long-answer questions. Number them 1., 2., 3."
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=768)
-    # ensure inputs are on same device as model
-    model_device = next(model.parameters()).device
-    inputs = {k: v.to(model_device) for k, v in inputs.items()}
+# -----------------------
+# Utilities: retrieval & prompt building
+# -----------------------
+def retrieve_examples(query: str, k: int = 4) -> List[str]:
+    qv = embedder.encode(query, convert_to_numpy=True).astype("float32")
+    D, I = index.search(np.expand_dims(qv, 0), k)
+    idxs = I[0].tolist()
+    examples = [df.iloc[i]["Question"] for i in idxs]
+    return examples
 
-    gen = model.generate(**inputs, max_new_tokens=300, num_beams=4, repetition_penalty=1.6, no_repeat_ngram_size=3, early_stopping=True)
-    out = tokenizer.decode(gen[0], skip_special_tokens=True)
-    st.subheader("Raw Output")
-    st.code(out[:4000])
-    st.subheader("Parsed Questions")
-    import re
-    matches = re.findall(r"(?:^|\n)\s*(\d{1,2})[.)\-]?\s*(.+?)(?=(?:\n\s*\d{1,2}[.)\-])|\Z)", out, flags=re.S)
+def build_prompt(class_no, chapter, examples: List[str], num_q: int):
+    examples_block = "\n".join([f"{i+1}. {ex.strip()}" for i, ex in enumerate(examples)])
+    prompt = (
+        f"You are an experienced NCERT Class {class_no} teacher.\n"
+        f"CHAPTER: {chapter}\n\n"
+        f"Below are example teacher-style long-answer questions that show the required style and depth:\n\n"
+        f"{examples_block}\n\n"
+        f"Using the same style, write EXACTLY {num_q} numbered teacher-style long-answer questions for the chapter '{chapter}'. "
+        "Number them 1., 2., 3., ... Each question must be a single sentence ending with a question mark. Prefer questions that refer to chapter activities or examples where suitable."
+    )
+    return prompt
+
+# Parsing function
+def parse_numbered_questions(text: str) -> List[str]:
+    matches = re.findall(r"(?:^|\n)\s*(\d{1,2})[.)\-]?\s*(.+?)(?=(?:\n\s*\d{1,2}[.)\-])|\Z)", text, flags=re.S)
+    qs = []
     if matches:
-        for i, (_, q) in enumerate(matches, 1):
-            q = q.strip()
+        for _, txt in matches:
+            q = " ".join(txt.split())
             if not q.endswith("?"):
                 q = q.rstrip(". ") + "?"
-            st.write(f"**{i}.** {q}")
+            qs.append(q)
     else:
-        st.write(out)
+        sents = re.findall(r"[A-Z][^?!.]{10,}\?", text)
+        for s in sents:
+            qs.append(s.strip())
+    return qs
+
+# -----------------------
+# Generation routine
+# -----------------------
+def generate_from_prompt(prompt: str, num_return_sequences: int = 1, max_new_tokens: int = 300) -> List[str]:
+    enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=768)
+    enc = {k: v.to(next(model.parameters()).device) for k, v in enc.items()}
+    out = model.generate(
+        **enc,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.92,
+        repetition_penalty=1.6,
+        no_repeat_ngram_size=3,
+        num_return_sequences=num_return_sequences,
+        early_stopping=True
+    )
+    return [tokenizer.decode(o, skip_special_tokens=True) for o in out]
+
+# -----------------------
+# Generation button action
+# -----------------------
+if generate_btn:
+    with st.spinner("Retrieving examples & generating..."):
+        # Use chapter text and some example questions for retrieval
+        seed_text = chapter_choice
+        retrieved = retrieve_examples(seed_text, k=retrieve_k)
+        st.markdown("**Retrieved examples (style used in prompt):**")
+        for i, ex in enumerate(retrieved, 1):
+            st.write(f"{i}. {ex}")
+
+        # Build prompt and sample multiple times to aggregate diversity
+        prompt = build_prompt(class_choice, chapter_choice, retrieved, num_questions)
+        sampled_texts = []
+        for _ in range(num_samples):
+            sampled_texts += generate_from_prompt(prompt, num_return_sequences=1, max_new_tokens=350)
+
+        # Parse & deduplicate
+        candidates = []
+        seen = set()
+        for raw in sampled_texts:
+            parsed = parse_numbered_questions(raw)
+            for q in parsed:
+                key = q.lower()
+                if key not in seen and len(q.split()) > 4:
+                    candidates.append(q)
+                    seen.add(key)
+        # Fill templates if insufficient
+        templates = [
+            f"Explain the main ideas of the chapter '{chapter_choice}' with suitable examples?",
+            f"What are the key points discussed in '{chapter_choice}' and why are they important?",
+            f"Describe any important activity from '{chapter_choice}' and explain its outcome?",
+            f"How does the chapter '{chapter_choice}' relate to daily life? Give examples?"
+        ]
+        for t in templates:
+            if len(candidates) >= num_questions:
+                break
+            if t not in seen:
+                candidates.append(t)
+                seen.add(t.lower())
+
+        final = candidates[:num_questions]
+
+        # Display results
+        st.subheader("Generated Questions")
+        for i, q in enumerate(final, 1):
+            st.markdown(f"**{i}.** {q}")
+
+        # Show raw outputs in expanders
+        st.subheader("Raw model outputs")
+        for i, raw in enumerate(sampled_texts, 1):
+            with st.expander(f"Raw sample {i} (truncated)"):
+                st.code(raw[:4000])
+
+        # Download CSV
+        out_df = pd.DataFrame({
+            "Class": [class_choice]*len(final),
+            "Chapter": [chapter_choice]*len(final),
+            "Question_No": list(range(1, len(final)+1)),
+            "Question": final
+        })
+        csv_bytes = out_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download generated questions CSV", data=csv_bytes, file_name="generated_ncert_questions.csv", mime="text/csv")
