@@ -1,58 +1,76 @@
 import streamlit as st
-import io, csv
+import pandas as pd
+import random
 
-st.set_page_config(page_title="NCERT Teacher Question Generator", layout="wide")
-st.title("📘 NCERT Teacher-Style Question Generator (CSV-only, lightweight)")
-st.write("Upload a CSV file with headers: Class, Chapter, Question")
+# ----------------------------
+# Page config
+# ----------------------------
+st.set_page_config(
+    page_title="NCERT Question Generator",
+    layout="wide"
+)
 
-uploaded = st.file_uploader("Upload CSV (CSV must contain headers: Class, Chapter, Question)", type=["csv"])
-if not uploaded:
-    st.info("Please upload your CSV file to proceed.")
-    st.stop()
+st.title("📘 NCERT Chapter-wise Question Generator")
+st.write("Generate questions **directly from CSV** based on chapter name")
 
-try:
-    # uploaded is a BytesIO; decode to text
-    text_io = io.TextIOWrapper(uploaded, encoding="utf-8")
-    reader = csv.DictReader(text_io)
-    rows = [r for r in reader]
-except Exception as e:
-    st.error(f"Could not read CSV: {e}")
-    st.stop()
+# ----------------------------
+# Load CSV
+# ----------------------------
+@st.cache_data
+def load_data(csv_file):
+    return pd.read_csv(csv_file)
 
-required_cols = {"Class", "Chapter", "Question"}
-if not required_cols.issubset(set(reader.fieldnames or [])):
-    st.error(f"CSV must have headers: {required_cols}. Found: {reader.fieldnames}")
-    st.stop()
+uploaded_file = st.file_uploader("📂 Upload Questions CSV", type=["csv"])
 
-classes = sorted({r["Class"].strip() for r in rows if r.get("Class")})
-if not classes:
-    st.error("No 'Class' values found in CSV.")
-    st.stop()
+if uploaded_file:
+    df = load_data(uploaded_file)
 
-selected_class = st.selectbox("Select Class", classes)
+    required_columns = {
+        "class", "chapter", "question",
+        "option_a", "option_b", "option_c", "option_d", "answer"
+    }
 
-chapters_set = sorted({r["Chapter"].strip() for r in rows if r.get("Class") and r["Class"].strip() == str(selected_class)})
-if not chapters_set:
-    chapter_choice = st.text_input("Chapter name (no chapters found for this class)")
+    if not required_columns.issubset(set(df.columns)):
+        st.error("❌ CSV does not contain required columns")
+        st.stop()
+
+    # ----------------------------
+    # User Inputs
+    # ----------------------------
+    chapter_name = st.text_input("📖 Enter Chapter Name", placeholder="e.g. Nutrition in Plants")
+    num_questions = st.number_input(
+        "🔢 Number of Questions",
+        min_value=1,
+        max_value=50,
+        value=5
+    )
+
+    if st.button("🚀 Generate Questions"):
+        filtered_df = df[df["chapter"].str.lower() == chapter_name.lower()]
+
+        if filtered_df.empty:
+            st.warning("⚠ No questions found for this chapter")
+        else:
+            questions = filtered_df.sample(
+                min(num_questions, len(filtered_df)),
+                random_state=random.randint(1, 10000)
+            )
+
+            st.success(f"✅ Showing {len(questions)} questions from **{chapter_name}**")
+
+            # ----------------------------
+            # Display Questions
+            # ----------------------------
+            for idx, row in enumerate(questions.itertuples(), start=1):
+                st.markdown(f"### Q{idx}. {row.question}")
+
+                st.write(f"A. {row.option_a}")
+                st.write(f"B. {row.option_b}")
+                st.write(f"C. {row.option_c}")
+                st.write(f"D. {row.option_d}")
+
+                with st.expander("✅ Show Answer"):
+                    st.write(f"**Correct Answer:** {row.answer}")
+
 else:
-    chapter_choice = st.selectbox("Select Chapter", chapters_set)
-
-filtered = [r for r in rows if r.get("Class") and r.get("Chapter") and r["Class"].strip() == str(selected_class) and r["Chapter"].strip() == str(chapter_choice)]
-
-st.subheader(f"📖 Questions for Class {selected_class} — {chapter_choice}")
-if not filtered:
-    st.info("No questions found for this Class & Chapter. Ensure CSV rows exactly match Class and Chapter text.")
-else:
-    for idx, r in enumerate(filtered, start=1):
-        q = (r.get("Question") or "").strip()
-        if q:
-            st.markdown(f"**{idx}. {q}**")
-
-# download filtered CSV
-if filtered:
-    out = io.StringIO()
-    writer = csv.DictWriter(out, fieldnames=["Class", "Chapter", "Question"])
-    writer.writeheader()
-    for r in filtered:
-        writer.writerow({"Class": r.get("Class",""), "Chapter": r.get("Chapter",""), "Question": r.get("Question","")})
-    st.download_button("Download filtered questions CSV", data=out.getvalue().encode("utf-8"), file_name="filtered_questions.csv")
+    st.info("⬆ Upload your questions CSV to get started")
